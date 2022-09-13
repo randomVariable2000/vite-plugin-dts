@@ -70,6 +70,7 @@ const fullRelativeRE = /^\.\.?\//
 const defaultIndex = 'index.d.ts'
 // eslint-disable-next-line @typescript-eslint/no-empty-function
 const noop = () => {}
+export const SKIP = '__skip'
 
 const logPrefix = chalk.cyan('[vite:dts]')
 const bundleDebug = debug('vite-plugin-dts:bundle')
@@ -107,9 +108,310 @@ export function dtsPlugin(options: PluginOptions = {}): Plugin {
   let isBundle = false
 
   const sourceDtsFiles = new Set<SourceFile>()
+  const cache = new Map<string, SourceFile>()
+  const filePaths: string[] = []
 
   let hasJsVue = false
   let allowJs = false
+  let hasCloseBundle = false
+
+  async function handler(path?: string[] | string) {
+    if (!outputDirs || !project || isBundle) return
+    logger.info(chalk.green(`\n${logPrefix} Start generate declaration files...`))
+    bundleDebug('start')
+
+    isBundle = true
+    sourceDtsFiles.clear()
+
+    const startTime = Date.now()
+    const includedFileSet = new Set<string>()
+    let include: string | string[]
+    const tsConfig: {
+      extends?: string,
+      include?: string[],
+      exclude?: string[]
+    } = readConfigFile(tsConfigPath, project.getFileSystem().readFileSync).config ?? {}
+
+    // #95 should parse include or exclude from the base config when they are missing from the inheriting config
+    // if the inherit config doesn't have `include` or `exclude` field,
+    // should get them from the parent config.
+    const parentTsConfigPath = tsConfig.extends && ensureAbsolute(tsConfig.extends, root)
+    const parentTsConfig: {
+      include?: string[],
+      exclude?: string[]
+    } = parentTsConfigPath
+      ? readConfigFile(parentTsConfigPath, project.getFileSystem().readFileSync).config
+      : {}
+    const exclude =
+      options.exclude ?? tsConfig.exclude ?? parentTsConfig.exclude ?? 'node_modules/**'
+    if (!path) {
+      include = options.include ?? tsConfig.include ?? parentTsConfig.include ?? '**/*'
+    } else {
+      include = ensureArray(path).map(i => normalizePath(i))
+    }
+
+    bundleDebug('read config')
+
+    if (include && include.length) {
+      const files = await glob(ensureArray(include).map(normalizeGlob), {
+        cwd: root,
+        absolute: true,
+        ignore: ensureArray(exclude).map(normalizeGlob)
+      })
+
+      files.forEach(file => {
+        if (dtsRE.test(file)) {
+          if (!copyDtsFiles) {
+            return
+          }
+
+          includedFileSet.add(file)
+          sourceDtsFiles.add(project.addSourceFileAtPath(file))
+          return
+        }
+
+        includedFileSet.add(`${tjsRE.test(file) ? file.replace(tjsRE, '') : file}.d.ts`)
+      })
+
+      if (hasJsVue) {
+        if (!allowJs) {
+          logger.warn(
+            chalk.yellow(
+              `${chalk.cyan(
+                '[vite:dts]'
+              )} Some js files are referenced, but you may not enable the 'allowJs' option.`
+            )
+          )
+        }
+
+        project.compilerOptions.set({ allowJs: true })
+      }
+
+      bundleDebug('collect files')
+    }
+
+    project.resolveSourceFileDependencies()
+    bundleDebug('resolve')
+
+    if (!skipDiagnostics) {
+      const diagnostics = project.getPreEmitDiagnostics()
+
+      if (diagnostics?.length && logDiagnostics) {
+        logger.warn(project.formatDiagnosticsWithColorAndContext(diagnostics))
+      }
+
+      if (typeof afterDiagnostic === 'function') {
+        const result = afterDiagnostic(diagnostics)
+
+        isPromise(result) && (await result)
+      }
+
+      bundleDebug('diagnostics')
+    }
+
+    const dtsOutputFiles = Array.from(sourceDtsFiles).map(sourceFile => ({
+      path: sourceFile.getFilePath(),
+      content: sourceFile.getFullText()
+    }))
+
+    const service = project.getLanguageService()
+    const globPatterns = filePaths.filter(i => ensureArray(include).some(c => i.includes(c)))
+    const outputFiles = project
+      .getSourceFiles(globPatterns.length ? globPatterns : undefined)
+      .map(sourceFile => {
+        console.time()
+        console.log('getFilePath', sourceFile.getFilePath())
+        if (!globPatterns.length) {
+          filePaths.push(sourceFile.getFilePath())
+        }
+        const is = Object.is(cache.get(sourceFile.getFilePath()), sourceFile)
+        console.log(is)
+        if (is) return false
+        cache.set(sourceFile.getFilePath(), Object.assign({}, sourceFile))
+        console.timeEnd()
+        console.time()
+        const outputFiles = service.getEmitOutput(sourceFile, true).getOutputFiles()
+        console.timeEnd()
+
+        console.time()
+        const c = outputFiles.map(outputFile => {
+          const content = outputFile.getText()
+          const path = normalizePath(resolve(root, outputFile.compilerObject.name))
+          return {
+            path,
+            content
+          }
+        })
+        console.timeEnd()
+        return c
+      })
+      .flat()
+      .filter(Boolean)
+      .concat(dtsOutputFiles)
+
+    bundleDebug('emit')
+
+    if (!entryRoot) {
+      entryRoot = queryPublicPath(outputFiles.map(file => file.path))
+    }
+
+    entryRoot = ensureAbsolute(entryRoot, root)
+
+    const wroteFiles = new Set<string>()
+    const outputDir = outputDirs[0]
+
+    await runParallel(os.cpus().length, outputFiles, async outputFile => {
+      let filePath = outputFile.path
+      let content = outputFile.content
+
+      const isMapFile = filePath.endsWith('.map')
+
+      if (
+        !includedFileSet.has(isMapFile ? filePath.slice(0, -4) : filePath) ||
+        (clearPureImport && content === noneExport)
+      ) {
+        return
+      }
+
+      if (!isMapFile && content && content !== noneExport) {
+        content = clearPureImport ? removePureImport(content) : content
+        content = transformAliasImport(filePath, content, aliases, aliasesExclude)
+        content = staticImport || rollupTypes ? transformDynamicImport(content) : content
+      }
+
+      filePath = resolve(
+        outputDir,
+        relative(entryRoot, cleanVueFileName ? filePath.replace('.vue.d.ts', '.d.ts') : filePath)
+      )
+
+      let result
+      if (typeof beforeWriteFile === 'function') {
+        result = beforeWriteFile(filePath, content)
+
+        if (result && isNativeObj(result)) {
+          filePath = result.filePath ?? filePath
+          content = result.content ?? content
+        }
+      }
+
+      if (result !== SKIP) {
+        await fs.mkdir(dirname(filePath), { recursive: true })
+        await fs.writeFile(
+          filePath,
+          cleanVueFileName ? content.replace(/['"](.+)\.vue['"]/g, '"$1"') : content,
+          'utf-8'
+        )
+      }
+
+      wroteFiles.add(normalizePath(filePath))
+    })
+
+    bundleDebug('output')
+
+    if (insertTypesEntry || rollupTypes) {
+      const pkgPath = resolve(root, 'package.json')
+      const pkg = fs.existsSync(pkgPath) ? JSON.parse(await fs.readFile(pkgPath, 'utf-8')) : {}
+      const types = pkg.types || pkg.typings
+
+      let typesPath = types ? resolve(root, types) : resolve(outputDir, indexName)
+
+      if (!fs.existsSync(typesPath)) {
+        const entry = entries[0]
+        const outputIndex = resolve(outputDir, relative(entryRoot, entry.replace(tsRE, '.d.ts')))
+
+        let filePath = normalizePath(relative(dirname(typesPath), outputIndex))
+
+        filePath = filePath.replace(dtsRE, '')
+        filePath = fullRelativeRE.test(filePath) ? filePath : `./${filePath}`
+
+        let content = `export * from '${filePath}'\n`
+
+        if (fs.existsSync(outputIndex)) {
+          const entryCodes = await fs.readFile(outputIndex, 'utf-8')
+
+          if (entryCodes.includes('export default')) {
+            content += `import ${libName} from '${filePath}'\nexport default ${libName}\n`
+          }
+        }
+
+        if (typeof beforeWriteFile === 'function') {
+          const result = beforeWriteFile(typesPath, content)
+
+          if (result && isNativeObj(result)) {
+            typesPath = result.filePath ?? typesPath
+            content = result.content ?? content
+          }
+        }
+
+        await fs.writeFile(typesPath, content, 'utf-8')
+        wroteFiles.add(normalizePath(typesPath))
+      }
+
+      bundleDebug('insert index')
+
+      if (rollupTypes) {
+        logger.info(chalk.green(`${logPrefix} Start rollup declaration files...`))
+
+        rollupDeclarationFiles({
+          root,
+          tsConfigPath,
+          compilerOptions,
+          outputDir,
+          entryPath: typesPath,
+          fileName: basename(typesPath)
+        })
+
+        const wroteFile = normalizePath(typesPath)
+
+        wroteFiles.delete(wroteFile)
+        await runParallel(os.cpus().length, Array.from(wroteFiles), f => fs.unlink(f))
+        removeDirIfEmpty(outputDir)
+        wroteFiles.clear()
+        wroteFiles.add(wroteFile)
+
+        if (copyDtsFiles) {
+          await runParallel(os.cpus().length, dtsOutputFiles, async ({ path, content }) => {
+            const filePath = resolve(outputDir, basename(path))
+
+            await fs.writeFile(filePath, content, 'utf-8')
+            wroteFiles.add(normalizePath(filePath))
+          })
+        }
+
+        bundleDebug('rollup')
+      }
+    }
+
+    if (outputDirs.length > 1) {
+      const dirs = outputDirs.slice(1)
+
+      await runParallel(os.cpus().length, Array.from(wroteFiles), async wroteFile => {
+        const relativePath = relative(outputDir, wroteFile)
+        const content = await fs.readFile(wroteFile, 'utf-8')
+
+        await Promise.all(
+          dirs.map(async dir => {
+            const filePath = resolve(dir, relativePath)
+
+            await fs.mkdir(dirname(filePath), { recursive: true })
+            await fs.writeFile(filePath, content, 'utf-8')
+          })
+        )
+      })
+    }
+
+    if (typeof afterBuild === 'function') {
+      const result = afterBuild()
+
+      isPromise(result) && (await result)
+    }
+
+    bundleDebug('finish')
+
+    logger.info(
+      chalk.green(`${logPrefix} Declaration files built in ${Date.now() - startTime}ms.\n`)
+    )
+  }
 
   return {
     name: 'vite:dts',
@@ -244,7 +546,7 @@ export function dtsPlugin(options: PluginOptions = {}): Plugin {
       return null
     },
 
-    watchChange(id) {
+    async watchChange(id) {
       if (watchExtensionRE.test(id)) {
         isBundle = false
 
@@ -254,280 +556,13 @@ export function dtsPlugin(options: PluginOptions = {}): Plugin {
           sourceFile && project.removeSourceFile(sourceFile)
         }
       }
+      await handler(id)
     },
 
     async closeBundle() {
-      if (!outputDirs || !project || isBundle) return
-
-      logger.info(chalk.green(`\n${logPrefix} Start generate declaration files...`))
-      bundleDebug('start')
-
-      isBundle = true
-
-      sourceDtsFiles.clear()
-
-      const startTime = Date.now()
-      const tsConfig: {
-        extends?: string,
-        include?: string[],
-        exclude?: string[]
-      } = readConfigFile(tsConfigPath, project.getFileSystem().readFileSync).config ?? {}
-
-      // #95 should parse include or exclude from the base config when they are missing from the inheriting config
-      // if the inherit config doesn't have `include` or `exclude` field,
-      // should get them from the parent config.
-      const parentTsConfigPath = tsConfig.extends && ensureAbsolute(tsConfig.extends, root)
-      const parentTsConfig: {
-        include?: string[],
-        exclude?: string[]
-      } = parentTsConfigPath
-        ? readConfigFile(parentTsConfigPath, project.getFileSystem().readFileSync).config
-        : {}
-
-      const include = options.include ?? tsConfig.include ?? parentTsConfig.include ?? '**/*'
-      const exclude =
-        options.exclude ?? tsConfig.exclude ?? parentTsConfig.exclude ?? 'node_modules/**'
-
-      bundleDebug('read config')
-
-      const includedFileSet = new Set<string>()
-
-      if (include && include.length) {
-        const files = await glob(ensureArray(include).map(normalizeGlob), {
-          cwd: root,
-          absolute: true,
-          ignore: ensureArray(exclude).map(normalizeGlob)
-        })
-
-        files.forEach(file => {
-          if (dtsRE.test(file)) {
-            if (!copyDtsFiles) {
-              return
-            }
-
-            includedFileSet.add(file)
-            sourceDtsFiles.add(project.addSourceFileAtPath(file))
-            return
-          }
-
-          includedFileSet.add(`${tjsRE.test(file) ? file.replace(tjsRE, '') : file}.d.ts`)
-        })
-
-        if (hasJsVue) {
-          if (!allowJs) {
-            logger.warn(
-              chalk.yellow(
-                `${chalk.cyan(
-                  '[vite:dts]'
-                )} Some js files are referenced, but you may not enable the 'allowJs' option.`
-              )
-            )
-          }
-
-          project.compilerOptions.set({ allowJs: true })
-        }
-
-        bundleDebug('collect files')
-      }
-
-      project.resolveSourceFileDependencies()
-      bundleDebug('resolve')
-
-      if (!skipDiagnostics) {
-        const diagnostics = project.getPreEmitDiagnostics()
-
-        if (diagnostics?.length && logDiagnostics) {
-          logger.warn(project.formatDiagnosticsWithColorAndContext(diagnostics))
-        }
-
-        if (typeof afterDiagnostic === 'function') {
-          const result = afterDiagnostic(diagnostics)
-
-          isPromise(result) && (await result)
-        }
-
-        bundleDebug('diagnostics')
-      }
-
-      const dtsOutputFiles = Array.from(sourceDtsFiles).map(sourceFile => ({
-        path: sourceFile.getFilePath(),
-        content: sourceFile.getFullText()
-      }))
-
-      const service = project.getLanguageService()
-      const outputFiles = project
-        .getSourceFiles()
-        .map(sourceFile =>
-          service
-            .getEmitOutput(sourceFile, true)
-            .getOutputFiles()
-            .map(outputFile => ({
-              path: normalizePath(resolve(root, outputFile.compilerObject.name)),
-              content: outputFile.getText()
-            }))
-        )
-        .flat()
-        .concat(dtsOutputFiles)
-
-      bundleDebug('emit')
-
-      if (!entryRoot) {
-        entryRoot = queryPublicPath(outputFiles.map(file => file.path))
-      }
-
-      entryRoot = ensureAbsolute(entryRoot, root)
-
-      const wroteFiles = new Set<string>()
-      const outputDir = outputDirs[0]
-
-      await runParallel(os.cpus().length, outputFiles, async outputFile => {
-        let filePath = outputFile.path
-        let content = outputFile.content
-
-        const isMapFile = filePath.endsWith('.map')
-
-        if (
-          !includedFileSet.has(isMapFile ? filePath.slice(0, -4) : filePath) ||
-          (clearPureImport && content === noneExport)
-        ) {
-          return
-        }
-
-        if (!isMapFile && content && content !== noneExport) {
-          content = clearPureImport ? removePureImport(content) : content
-          content = transformAliasImport(filePath, content, aliases, aliasesExclude)
-          content = staticImport || rollupTypes ? transformDynamicImport(content) : content
-        }
-
-        filePath = resolve(
-          outputDir,
-          relative(entryRoot, cleanVueFileName ? filePath.replace('.vue.d.ts', '.d.ts') : filePath)
-        )
-
-        if (typeof beforeWriteFile === 'function') {
-          const result = beforeWriteFile(filePath, content)
-
-          if (result && isNativeObj(result)) {
-            filePath = result.filePath ?? filePath
-            content = result.content ?? content
-          }
-        }
-
-        await fs.mkdir(dirname(filePath), { recursive: true })
-        await fs.writeFile(
-          filePath,
-          cleanVueFileName ? content.replace(/['"](.+)\.vue['"]/g, '"$1"') : content,
-          'utf-8'
-        )
-
-        wroteFiles.add(normalizePath(filePath))
-      })
-
-      bundleDebug('output')
-
-      if (insertTypesEntry || rollupTypes) {
-        const pkgPath = resolve(root, 'package.json')
-        const pkg = fs.existsSync(pkgPath) ? JSON.parse(await fs.readFile(pkgPath, 'utf-8')) : {}
-        const types = pkg.types || pkg.typings
-
-        let typesPath = types ? resolve(root, types) : resolve(outputDir, indexName)
-
-        if (!fs.existsSync(typesPath)) {
-          const entry = entries[0]
-          const outputIndex = resolve(outputDir, relative(entryRoot, entry.replace(tsRE, '.d.ts')))
-
-          let filePath = normalizePath(relative(dirname(typesPath), outputIndex))
-
-          filePath = filePath.replace(dtsRE, '')
-          filePath = fullRelativeRE.test(filePath) ? filePath : `./${filePath}`
-
-          let content = `export * from '${filePath}'\n`
-
-          if (fs.existsSync(outputIndex)) {
-            const entryCodes = await fs.readFile(outputIndex, 'utf-8')
-
-            if (entryCodes.includes('export default')) {
-              content += `import ${libName} from '${filePath}'\nexport default ${libName}\n`
-            }
-          }
-
-          if (typeof beforeWriteFile === 'function') {
-            const result = beforeWriteFile(typesPath, content)
-
-            if (result && isNativeObj(result)) {
-              typesPath = result.filePath ?? typesPath
-              content = result.content ?? content
-            }
-          }
-
-          await fs.writeFile(typesPath, content, 'utf-8')
-          wroteFiles.add(normalizePath(typesPath))
-        }
-
-        bundleDebug('insert index')
-
-        if (rollupTypes) {
-          logger.info(chalk.green(`${logPrefix} Start rollup declaration files...`))
-
-          rollupDeclarationFiles({
-            root,
-            tsConfigPath,
-            compilerOptions,
-            outputDir,
-            entryPath: typesPath,
-            fileName: basename(typesPath)
-          })
-
-          const wroteFile = normalizePath(typesPath)
-
-          wroteFiles.delete(wroteFile)
-          await runParallel(os.cpus().length, Array.from(wroteFiles), f => fs.unlink(f))
-          removeDirIfEmpty(outputDir)
-          wroteFiles.clear()
-          wroteFiles.add(wroteFile)
-
-          if (copyDtsFiles) {
-            await runParallel(os.cpus().length, dtsOutputFiles, async ({ path, content }) => {
-              const filePath = resolve(outputDir, basename(path))
-
-              await fs.writeFile(filePath, content, 'utf-8')
-              wroteFiles.add(normalizePath(filePath))
-            })
-          }
-
-          bundleDebug('rollup')
-        }
-      }
-
-      if (outputDirs.length > 1) {
-        const dirs = outputDirs.slice(1)
-
-        await runParallel(os.cpus().length, Array.from(wroteFiles), async wroteFile => {
-          const relativePath = relative(outputDir, wroteFile)
-          const content = await fs.readFile(wroteFile, 'utf-8')
-
-          await Promise.all(
-            dirs.map(async dir => {
-              const filePath = resolve(dir, relativePath)
-
-              await fs.mkdir(dirname(filePath), { recursive: true })
-              await fs.writeFile(filePath, content, 'utf-8')
-            })
-          )
-        })
-      }
-
-      if (typeof afterBuild === 'function') {
-        const result = afterBuild()
-
-        isPromise(result) && (await result)
-      }
-
-      bundleDebug('finish')
-
-      logger.info(
-        chalk.green(`${logPrefix} Declaration files built in ${Date.now() - startTime}ms.\n`)
-      )
+      if (hasCloseBundle) return
+      await handler()
+      hasCloseBundle = true
     }
   }
 }

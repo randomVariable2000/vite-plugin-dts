@@ -27,7 +27,7 @@ export default defineConfig({
   },
   plugins: [
     dtsPlugin({
-      outputDir: ['dist', 'types'],
+      outputDir: 'types',
       // include: ['src/index.ts'],
       exclude: ['src/ignore'],
       aliasesExclude: [/^@components/],
