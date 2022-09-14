@@ -158,7 +158,6 @@ export function dtsPlugin(options: PluginOptions = {}): Plugin {
         absolute: true,
         ignore: ensureArray(exclude).map(normalizeGlob)
       })
-
       files.forEach(file => {
         if (dtsRE.test(file)) {
           if (!copyDtsFiles) {
@@ -183,8 +182,6 @@ export function dtsPlugin(options: PluginOptions = {}): Plugin {
             )
           )
         }
-
-        project.compilerOptions.set({ allowJs: true })
       }
 
       bundleDebug('collect files')
@@ -216,24 +213,19 @@ export function dtsPlugin(options: PluginOptions = {}): Plugin {
 
     const service = project.getLanguageService()
     const globPatterns = filePaths.filter(i => ensureArray(include).some(c => i.includes(c)))
-    const outputFiles = project
-      .getSourceFiles(globPatterns.length ? globPatterns : undefined)
-      .map(sourceFile => {
-        console.time()
-        console.log('getFilePath', sourceFile.getFilePath())
+    const sourceFiles = project.getSourceFiles(globPatterns.length ? globPatterns : undefined)
+
+    const resolved = await Promise.all(
+      sourceFiles.map(async sourceFile => {
         if (!globPatterns.length) {
           filePaths.push(sourceFile.getFilePath())
         }
         const is = Object.is(cache.get(sourceFile.getFilePath()), sourceFile)
         console.log(is)
-        if (is) return false
+        if (is) return await false
         cache.set(sourceFile.getFilePath(), Object.assign({}, sourceFile))
-        console.timeEnd()
-        console.time()
         const outputFiles = service.getEmitOutput(sourceFile, true).getOutputFiles()
-        console.timeEnd()
 
-        console.time()
         const c = outputFiles.map(outputFile => {
           const content = outputFile.getText()
           const path = normalizePath(resolve(root, outputFile.compilerObject.name))
@@ -242,13 +234,11 @@ export function dtsPlugin(options: PluginOptions = {}): Plugin {
             content
           }
         })
-        console.timeEnd()
-        return c
+        return await c
       })
-      .flat()
-      .filter(Boolean)
-      .concat(dtsOutputFiles)
+    )
 
+    const outputFiles = resolved.flat().filter(Boolean).concat(dtsOutputFiles)
     bundleDebug('emit')
 
     if (!entryRoot) {
@@ -515,7 +505,8 @@ export function dtsPlugin(options: PluginOptions = {}): Plugin {
         skipAddingFilesFromTsConfig: true
       })
 
-      allowJs = project.getCompilerOptions().allowJs ?? false
+      project.compilerOptions.set({ allowJs: true })
+      allowJs = project.getCompilerOptions().allowJs ?? true
     },
 
     buildStart(inputOptions) {
